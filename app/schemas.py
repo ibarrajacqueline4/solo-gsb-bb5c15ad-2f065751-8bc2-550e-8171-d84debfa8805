@@ -465,7 +465,11 @@ class LimitCheckResponse(BaseModel):
     retry_after_ms: int = Field(
         default=0,
         ge=0,
-        description="仅超限时返回：建议等待毫秒数（至最老一笔成本滑出窗口）",
+        description=(
+            "仅超限时返回：建议等待毫秒数。按记录到期顺序累计释放的成本，"
+            "首次足以容纳本次 cost 的等待时长（同毫秒到期的记录合并判断）；"
+            "可能晚于 reset_at_ms——最老一笔滑出未必释放足够额度"
+        ),
     )
 
 

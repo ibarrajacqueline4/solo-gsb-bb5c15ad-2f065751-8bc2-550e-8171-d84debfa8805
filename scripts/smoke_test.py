@@ -28,6 +28,11 @@ cursor 分页不重不漏、非法 cursor/limit 拒绝、批量冲突仅冲突�
 参数校验 / 过期数据自动清理，以及 request_id 幂等：
 重试回放不重复扣减 / 并发相同 request_id 只扣一次 / 429 结果回放 /
 request_id 跨窗口可复用 / 非法 request_id 拒绝；
+以及加权拒绝的重试等待：limit=5 窗口内先后通过成本 1 与 4 后成本 3
+被拒，retry_after_ms 按记录到期顺序累计释放、首次足以容纳本次 cost
+（等到成本 4 滑出而非仅最早的成本 1），reset_at_ms 仍为最老记录滑出、
+按旧等待时长重试仍 429 / 等到位后放行，同毫秒到期记录合并判断
+（直连 Redis 构造同分记录验证）；
 以及任务依赖门禁：
 无定义即可执行 / 保存去重且限 16 个 / 自身依赖 422 /
 环检测只遍历现有定义且拒绝时保留原定义 / 空列表清除 /
@@ -1297,6 +1302,7 @@ def limit_checks():
               all(r["retry_after_ms"] > 0 for r in denied), f"{denied[:2]}")
 
     idempotency_checks()
+    limit_retry_after_checks()
 
 
 def idempotency_checks():
@@ -1456,6 +1462,105 @@ def idempotency_checks():
           x1["allowed"] and y1["allowed"]
           and x1["idempotent_replay"] is False
           and y1["idempotent_replay"] is False, f"{x1} {y1}")
+
+
+def limit_retry_after_checks():
+    """/v1/limits/check 加权拒绝的重试等待回归：
+
+    按记录到期顺序累计释放的成本，返回首次足以容纳本次 cost 的等待毫秒数
+    （同毫秒到期记录合并判断）；reset_at_ms 保持"最老一笔滑出"语义不变。"""
+    base = f"smoke-limit-retry:{int(time.time() * 1000)}"
+    path = "/v1/limits/check"
+
+    # 任务场景：limit=5，同一窗口内先后通过成本 1 与 4（已用 5），随后成本 3
+    # 被拒。旧行为 retry_after_ms 只等最早的成本 1 滑出——届时已用 4 仍放不下
+    # 3，会再次 429；修复后必须等到成本 4 那笔也滑出（累计释放 1+4=5 >= 3）。
+    key = f"{base}:weighted"
+    code, b1 = call("POST", path, {"client_key": key, "limit": 5,
+                                   "window_ms": 4_000, "cost": 1})
+    check("retry allow cost 1",
+          code == 200 and b1["allowed"] and b1["remaining"] == 4, f"{code} {b1}")
+    first_reset = b1["reset_at_ms"]  # 最早一笔（成本 1）滑出时刻
+    time.sleep(1.0)  # 拉开两笔记录的到期时刻，便于区分两种等待时长
+    code, b2 = call("POST", path, {"client_key": key, "limit": 5,
+                                   "window_ms": 4_000, "cost": 4})
+    check("retry allow cost 4",
+          code == 200 and b2["allowed"] and b2["remaining"] == 0, f"{code} {b2}")
+    check("retry reset_at still oldest after cost 4",
+          b2["reset_at_ms"] == first_reset, f"{b2} vs {first_reset}")
+
+    code, headers, d = call_ex("POST", path, {"client_key": key, "limit": 5,
+                                              "window_ms": 4_000, "cost": 3})
+    check("retry deny cost 3 -> 429",
+          code == 429 and not d["allowed"] and d["remaining"] == 0, f"{code} {d}")
+    # reset_at_ms 语义不变：仍是最早记录（成本 1）滑出时刻
+    check("retry deny reset_at unchanged",
+          d["reset_at_ms"] == first_reset, f"{d}")
+    now_ms = int(time.time() * 1000)
+    oldest_wait = d["reset_at_ms"] - now_ms
+    # retry_after_ms 必须指向第二笔（成本 4）滑出：比最早记录滑出晚约 1 秒
+    check("retry waits until enough released",
+          oldest_wait + 500 < d["retry_after_ms"] <= oldest_wait + 2000,
+          f"{d} oldest_wait={oldest_wait}")
+    check("retry Retry-After header matches body",
+          headers.get("Retry-After") is not None
+          and int(headers["Retry-After"]) == -(-d["retry_after_ms"] // 1000),
+          f"Retry-After={headers.get('Retry-After')} body={d}")
+
+    # 端到端回归：按旧语义只等最早记录滑出后重试，仍应 429（复现修复前提）；
+    # 再等第二笔也滑出后才放行
+    time.sleep(max(0.0, oldest_wait / 1000) + 0.3)
+    code, d2 = call("POST", path, {"client_key": key, "limit": 5,
+                                   "window_ms": 4_000, "cost": 3})
+    check("retry still 429 after only oldest slid out",
+          code == 429 and not d2["allowed"], f"{code} {d2}")
+    time.sleep(1.5)
+    code, a3 = call("POST", path, {"client_key": key, "limit": 5,
+                                   "window_ms": 4_000, "cost": 3})
+    check("retry allowed after enough slid out",
+          code == 200 and a3["allowed"] and a3["remaining"] == 2, f"{code} {a3}")
+
+    # 同毫秒到期记录合并判断：直连 Redis 写入两笔相同 score 的记录（公开 API
+    # 无法控制同毫秒落点）。窗口内已用 5（1 + 2 + 2），请求成本 2 被拒：
+    # 最老一笔（成本 1）滑出只释放 1 < 2，必须等到同毫秒的两笔（成本 2+2）
+    # 一起滑出（累计释放 5 >= 2）。
+    limit_prefix = os.environ.get("SMOKE_LIMIT_KEY_PREFIX", "ratelimit")
+    host = os.environ.get("SMOKE_REDIS_HOST", "localhost")
+    port = int(os.environ.get("SMOKE_REDIS_PORT", "6379"))
+    mkey = f"{base}:same-ms"
+    zkey = f"{limit_prefix}:{mkey}"
+    try:
+        r = _RespClient(host, port)
+    except OSError as exc:
+        check("retry same-ms redis reachable", False, f"{host}:{port} {exc}")
+        return
+    try:
+        sec, usec = r.execute("TIME")
+        now_server = int(sec) * 1000 + int(usec) // 1000
+        r.execute("ZADD", zkey, now_server - 1000, "a" * 32 + ":1")
+        r.execute("ZADD", zkey, now_server, "b" * 32 + ":2")
+        r.execute("ZADD", zkey, now_server, "c" * 32 + ":2")
+        r.execute("PEXPIRE", zkey, 10_000)
+        code, headers, dm = call_ex("POST", path,
+                                    {"client_key": mkey, "limit": 5,
+                                     "window_ms": 10_000, "cost": 2})
+        check("retry same-ms deny -> 429",
+              code == 429 and not dm["allowed"], f"{code} {dm}")
+        # reset_at_ms 仍是最老一笔（now-1000，成本 1）滑出时刻
+        check("retry same-ms reset_at is oldest",
+              dm["reset_at_ms"] == now_server - 1000 + 10_000,
+              f"{dm} expect {now_server - 1000 + 10_000}")
+        # retry_after 必须等到同毫秒两笔（now）一起滑出：≈10s，而非 ≈9s
+        now_ms = int(time.time() * 1000)
+        check("retry same-ms waits for whole group",
+              dm["retry_after_ms"] > dm["reset_at_ms"] - now_ms + 500,
+              f"{dm} oldest_wait={dm['reset_at_ms'] - now_ms}")
+        check("retry same-ms Retry-After header matches body",
+              headers.get("Retry-After") is not None
+              and int(headers["Retry-After"]) == -(-dm["retry_after_ms"] // 1000),
+              f"Retry-After={headers.get('Retry-After')} body={dm}")
+    finally:
+        r.close()
 
 
 def set_dependencies(k, deps):

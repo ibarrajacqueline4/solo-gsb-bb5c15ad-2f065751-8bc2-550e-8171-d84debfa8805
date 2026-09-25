@@ -1045,7 +1045,9 @@ async def check_limit(
 
     - 未超限（`used + cost <= limit`）：原子记入本次成本，返回 **200**、
       `remaining` 与 `reset_at_ms`（窗口内最老一笔成本滑出的时刻）。
-    - 超限：不扣减，返回 **429** 与 `retry_after_ms`（等待最老一笔成本滑出后重试），
+    - 超限：不扣减，返回 **429** 与 `retry_after_ms`——按记录到期顺序累计
+      将释放的成本，首次足以容纳本次 `cost` 的等待毫秒数（同毫秒到期的记录
+      合并判断；可能晚于 `reset_at_ms`，最老一笔滑出未必释放足够额度），
       同时携带标准 `Retry-After` 响应头（秒）。
 
     **可选幂等（request_id）**：请求体携带 `request_id` 时，同一

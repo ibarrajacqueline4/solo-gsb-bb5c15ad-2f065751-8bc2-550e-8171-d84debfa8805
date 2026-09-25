@@ -35,7 +35,9 @@
 
 另提供 **Redis Lua 原子滑动窗口（成本）限流 API**：`POST /v1/limits/check`
 按 Redis 服务器时间累计滑动窗口内的请求成本，未超限则原子扣减并返回剩余额度，
-超限返回 `429` 与建议重试时间；同一 `client_key` 的并发请求不会超额，过期窗口
+超限返回 `429` 与建议重试时间——按记录到期顺序累计释放的成本、首次足以容纳
+本次 `cost` 的等待毫秒数（同毫秒到期合并判断），避免加权场景下"只等最老一笔、
+届时额度仍不足"的过早重试；同一 `client_key` 的并发请求不会超额，过期窗口
 数据自动清理。请求还可携带可选 `request_id` 实现**窗口内请求幂等**：相同
 `client_key` + `request_id` 的并发或重试请求直接返回首次判定结果且不重复扣减，
 `request_id` 仅在对应窗口内存活，跨窗口可再次使用。
@@ -706,6 +708,19 @@ curl -s -X POST localhost:8000/v1/limits/check \
   -d '{"client_key": "tenant-42:bulk", "limit": 100, "window_ms": 60000, "cost": 30}'
 # => 200 {"allowed":true,...,"remaining":70,...}
 
+# 加权拒绝的重试等待：limit=5 的窗口内先后通过成本 1 与 4（已用 5），
+# 再请求成本 3 被拒。retry_after_ms 不是"最早一笔（成本 1）滑出"——
+# 届时已用 4 仍放不下 3——而是按记录到期顺序累计释放、首次足以容纳
+# 本次 cost 的等待毫秒数（成本 1 与 4 都滑出，累计释放 5 >= 3）：
+curl -i -X POST localhost:8000/v1/limits/check \
+  -H 'Content-Type: application/json' \
+  -d '{"client_key": "tenant-42:weighted", "limit": 5, "window_ms": 60000, "cost": 3}'
+# => HTTP/1.1 429 Too Many Requests
+#    Retry-After: 58
+# {"allowed":false,...,"remaining":0,"reset_at_ms":1758...,"retry_after_ms":57980}
+# reset_at_ms 仍是"最老一笔滑出"的时刻（语义不变）；retry_after_ms 可能更晚，
+# 同毫秒到期的记录合并累计判断。按它等待后重试不会因额度仍不足而再次 429。
+
 # request_id 幂等：相同 client_key + request_id 在窗口内只扣减一次。
 # 首次请求正常判定（假设通过）：
 curl -s -X POST localhost:8000/v1/limits/check \
@@ -744,8 +759,8 @@ curl -i -X POST localhost:8000/v1/limits/check \
 | `request_id` | 响应 | 原样回显请求携带的幂等标识；未携带时为 `null` |
 | `idempotent_replay` | 响应 | `true` 表示本次为幂等回放（未重复扣减），响应头同时带 `Idempotent-Replay: true`；默认 `false` |
 | `remaining` | 响应 | 放行后窗口内剩余成本；超限时为未扣减情况下的剩余值；回放时为首次结果快照 |
-| `reset_at_ms` | 响应 | 窗口内最老一笔成本滑出、可再获配额的时刻（Redis 服务器时钟，Unix 毫秒） |
-| `retry_after_ms` | 响应 | 仅 429 时非 0：建议等待毫秒数；响应头同时给出标准 `Retry-After`（秒，向上取整） |
+| `reset_at_ms` | 响应 | 窗口内最老一笔成本滑出的时刻（Redis 服务器时钟，Unix 毫秒）；仅表示最早释放点，不代表届时额度一定够本次请求 |
+| `retry_after_ms` | 响应 | 仅 429 时非 0：建议等待毫秒数——按记录到期顺序累计释放的成本首次足以容纳本次 `cost` 的等待时长（同毫秒到期的记录合并判断，可能晚于 `reset_at_ms`）；响应头同时给出标准 `Retry-After`（秒，向上取整） |
 
 ## 设计要点
 
@@ -925,8 +940,14 @@ curl -i -X POST localhost:8000/v1/limits/check \
 - **过期数据自动清理**：滑出窗口的记录在下次检查时被 `ZREMRANGEBYSCORE`
   即时删除，键同时设置 `PEXPIRE window_ms`，窗口结束后无流量时键也会自动消失，
   不残留空窗口数据。
-- **超限语义**：超限时返回 `429`，响应体给出 `remaining`、`reset_at_ms`、
-  `retry_after_ms`，并携带标准 `Retry-After` 头（秒，向上取整）。
+- **超限语义**：超限时返回 `429`，响应体给出 `remaining`、`reset_at_ms`
+  （最老一笔成本滑出的时刻，语义不变）与 `retry_after_ms`，并携带标准
+  `Retry-After` 头（秒，向上取整）。`retry_after_ms` 按记录到期顺序累计
+  将释放的成本，取**首次足以容纳本次 `cost`** 的等待毫秒数——同毫秒到期
+  的记录在同一时刻一起滑出，合并累计判断；因此加权场景下它可能晚于
+  `reset_at_ms`（最老一笔滑出未必释放足够额度，如窗口内 1+4、limit=5、
+  本次 cost=3 时须等到成本 4 那笔也滑出），按它重试不会因额度仍不足而
+  再次 429。
 - **request_id 幂等**：携带 `request_id` 时，"幂等命中判定 → 清旧 → 累计 →
   判定 → 扣减 → 记录完整响应"在**同一个 Lua 脚本**内完成，因此相同
   `client_key` + `request_id` 的并发请求也只有首个完成判定与扣减，其余直接
@@ -983,7 +1004,11 @@ task_key / 防栅序号 / 提交时间 / 当次 JSON、跨任务键按写入全�
 不重不漏、早于最早保留条目的游标 410、非法 cursor 400 / limit 越界 422、
 路由优先于 `{task_key}` 捕获；以及限流的剩余额度递减、成本加权、超限 429
 （含 `Retry-After` 头与不扣减语义）、窗口滑动后恢复、**20 并发恰好放行
-limit 笔不超额**、参数校验和过期数据自动清理；以及 `request_id` 幂等：
+limit 笔不超额**、参数校验和过期数据自动清理；以及**加权拒绝的重试等待**：
+limit=5 窗口内先后通过成本 1 与 4 后成本 3 被拒，`retry_after_ms` 按记录
+到期顺序累计释放、首次足以容纳本次成本（等到成本 4 滑出而非仅最早的成本 1，
+`reset_at_ms` 仍为最老记录滑出），按旧等待时长重试仍 429、等到位后放行，
+同毫秒到期记录合并判断（直连 Redis 构造同分记录验证）；以及 `request_id` 幂等：
 重试回放首次结果且不重复扣减、回放响应带 `Idempotent-Replay` 头、
 **20 个携带相同 request_id 的并发请求只扣减一次**、429 结果原样回放、
 `request_id` 跨窗口可再次使用、幂等作用域按 `client_key` 隔离、

@@ -28,6 +28,10 @@
 - 限流键是一个 ZSet：score 为请求时刻（Redis 服务器毫秒），
   member 形如 "<uuid>:<cost>"，cost 编码在 member 尾部，
   uuid 保证同毫秒并发请求的 member 不冲突。
+- 拒绝时的 retry_after_ms 不是"最老一笔滑出"：按记录到期顺序累计
+  将释放的成本（同毫秒到期的记录同一时刻一起滑出，合并累计判断），
+  取首次足以容纳本次 cost 的等待毫秒数，避免过早重试再次 429；
+  reset_at_ms 仍是最老一笔滑出的时刻，两者语义各自独立。
 - 幂等键（可选 request_id）是一个 Hash，保存首次判定的完整响应，
   TTL 等于首次请求的 window_ms：窗口内同键请求直接回放首次结果、
   不重复扣减；窗口结束后 Hash 自动删除，request_id 可再次使用。
@@ -744,6 +748,10 @@ return reply
 # 首次放行返回 {1, remaining, reset_at_ms}
 # 首次超限返回 {0, remaining, reset_at_ms, retry_after_ms}
 # reset_at_ms 为窗口内最老一笔成本滑出的时刻；窗口为空时取 now + window_ms。
+# retry_after_ms 为按记录到期顺序累计释放的成本首次足以容纳本次 cost 的
+# 等待毫秒数（同毫秒到期的记录合并累计判断），可能晚于 reset_at_ms：
+# 最老一笔滑出释放的成本未必容得下本次 cost（如窗口内 1+4、limit=5、
+# 本次 cost=3 时，只等成本 1 滑出后 used=4 仍超限）。
 LIMIT_CHECK_LUA = """
 local key = KEYS[1]
 
@@ -769,26 +777,46 @@ local window_start = now - window
 -- 清理已滑出窗口的旧记录，ZSet 中只保留当前窗口内的成本
 redis.call('ZREMRANGEBYSCORE', key, '-inf', window_start)
 
--- 从 member 尾部解析每笔成本并累计
+-- 按 score（请求时刻）升序取出全部在窗记录：既从 member 尾部解析成本
+-- 累计 used，也供拒绝时按到期顺序计算"累计释放多少成本"的等待时长
+local entries = redis.call('ZRANGE', key, 0, -1, 'WITHSCORES')
 local used = 0
-local members = redis.call('ZRANGE', key, 0, -1)
-for _, m in ipairs(members) do
-  used = used + tonumber(string.match(m, ':(%d+)$'))
+for i = 1, #entries, 2 do
+  used = used + tonumber(string.match(entries[i], ':(%d+)$'))
 end
 
-local oldest = redis.call('ZRANGE', key, 0, 0, 'WITHSCORES')
 local reset_at
-if #oldest == 0 then
+if #entries == 0 then
   reset_at = now + window
 else
-  reset_at = tonumber(oldest[2]) + window
+  reset_at = tonumber(entries[2]) + window
 end
 
 local allowed, remaining, retry_after
 if used + cost > limit then
   allowed = 0
   remaining = limit - used
-  retry_after = reset_at - now
+  -- 需要窗口内累计滑出 need 成本才容得下本次请求：按到期时刻（score
+  -- 升序）逐组合计将释放的成本——同毫秒（同 score）到期的记录在同一
+  -- 时刻一起滑出，必须合并成一组判断——首个使累计释放量达到 need 的
+  -- 到期时刻即为等待终点，避免"只等最老一笔、届时额度仍不足"的过早重试
+  local need = used + cost - limit
+  local released = 0
+  retry_after = reset_at - now  -- 兜底；cost <= limit 保证下面循环必然命中
+  local i = 1
+  while i <= #entries do
+    local expire_score = tonumber(entries[i + 1])
+    local j = i
+    while j <= #entries and tonumber(entries[j + 1]) == expire_score do
+      released = released + tonumber(string.match(entries[j], ':(%d+)$'))
+      j = j + 2
+    end
+    if released >= need then
+      retry_after = expire_score + window - now
+      break
+    end
+    i = j
+  end
 else
   allowed = 1
   remaining = limit - used - cost
