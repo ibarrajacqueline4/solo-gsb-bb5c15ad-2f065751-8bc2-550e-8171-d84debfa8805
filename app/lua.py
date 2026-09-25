@@ -28,6 +28,12 @@
 - 限流键是一个 ZSet：score 为请求时刻（Redis 服务器毫秒），
   member 形如 "<uuid>:<cost>"，cost 编码在 member 尾部，
   uuid 保证同毫秒并发请求的 member 不冲突。
+- 超限时的 retry_after_ms 按 score（即到期时刻 score + window）升序逐组
+  累计届时滑出窗口所释放的成本，取累计释放首次足以容纳本次 cost 的到期组
+  时刻，避免"只等最早一笔小成本滑出就重试、释放额度仍不足而再次 429"；
+  同一毫秒到期（score 相同）的记录合并为一组判断——它们在同一时刻一起
+  释放。reset_at_ms 始终表示最老一笔记录的滑出时刻，可能早于
+  retry_after_ms 对应的等待点。
 - 幂等键（可选 request_id）是一个 Hash，保存首次判定的完整响应，
   TTL 等于首次请求的 window_ms：窗口内同键请求直接回放首次结果、
   不重复扣减；窗口结束后 Hash 自动删除，request_id 可再次使用。
@@ -744,6 +750,9 @@ return reply
 # 首次放行返回 {1, remaining, reset_at_ms}
 # 首次超限返回 {0, remaining, reset_at_ms, retry_after_ms}
 # reset_at_ms 为窗口内最老一笔成本滑出的时刻；窗口为空时取 now + window_ms。
+# retry_after_ms 不是最老一笔成本的滑出等待，而是按到期顺序逐组累计滑出
+# 释放的成本，取累计释放首次 >= 本次 cost 的到期组时刻；同一毫秒到期
+# （score 相同）的记录合并为一组同时释放，组内成本一并计入累计。
 LIMIT_CHECK_LUA = """
 local key = KEYS[1]
 
@@ -769,26 +778,49 @@ local window_start = now - window
 -- 清理已滑出窗口的旧记录，ZSet 中只保留当前窗口内的成本
 redis.call('ZREMRANGEBYSCORE', key, '-inf', window_start)
 
--- 从 member 尾部解析每笔成本并累计
+-- 按 score 升序一次取出全部有效 member 及其 score（score 即成本计入时刻，
+-- score + window 即该笔成本的滑出 / 释放时刻，升序即为到期顺序）
+local entries = redis.call('ZRANGE', key, 0, -1, 'WITHSCORES')
 local used = 0
-local members = redis.call('ZRANGE', key, 0, -1)
-for _, m in ipairs(members) do
-  used = used + tonumber(string.match(m, ':(%d+)$'))
+for i = 1, #entries, 2 do
+  used = used + tonumber(string.match(entries[i], ':(%d+)$'))
 end
 
-local oldest = redis.call('ZRANGE', key, 0, 0, 'WITHSCORES')
 local reset_at
-if #oldest == 0 then
+if #entries == 0 then
   reset_at = now + window
 else
-  reset_at = tonumber(oldest[2]) + window
+  -- 最老一笔成本的滑出时刻（含义不变，与 retry_after_ms 相互独立）
+  reset_at = tonumber(entries[2]) + window
 end
 
 local allowed, remaining, retry_after
 if used + cost > limit then
   allowed = 0
   remaining = limit - used
-  retry_after = reset_at - now
+  -- 按到期顺序累计届时滑出窗口所释放的成本：score 相同（同一毫秒到期）
+  -- 的记录在同一时刻一起释放，必须合并为一组后再判断累计是否已足够，
+  -- 取累计释放首次足以容纳本次 cost 的到期组滑出时刻作为等待点——
+  -- 等待更短只会释放更少（或同额但仍不足）成本，重试必然再次 429。
+  -- used 为窗口内成本总和而 cost <= limit，故遍历所有到期组必然满足。
+  local released = 0
+  local i = 1
+  while i <= #entries do
+    local expires_at = tonumber(entries[i + 1]) + window
+    local group_release = 0
+    while i <= #entries
+        and tonumber(entries[i + 1]) + window == expires_at do
+      group_release = group_release
+        + tonumber(string.match(entries[i], ':(%d+)$'))
+      i = i + 2
+    end
+    released = released + group_release
+    if released >= cost then
+      retry_after = expires_at - now
+      if retry_after < 0 then retry_after = 0 end
+      break
+    end
+  end
 else
   allowed = 1
   remaining = limit - used - cost

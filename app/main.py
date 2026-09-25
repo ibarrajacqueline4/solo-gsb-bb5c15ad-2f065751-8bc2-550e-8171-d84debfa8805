@@ -115,7 +115,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Lease & Rate Limit API",
-    version="1.9.0",
+    version="1.9.1",
     description=(
         "供多个工作进程协调独占任务的租约服务、基于 Redis Lua 的"
         "原子滑动窗口成本限流，租约凭据保护的任务结果提交，"
@@ -1045,8 +1045,13 @@ async def check_limit(
 
     - 未超限（`used + cost <= limit`）：原子记入本次成本，返回 **200**、
       `remaining` 与 `reset_at_ms`（窗口内最老一笔成本滑出的时刻）。
-    - 超限：不扣减，返回 **429** 与 `retry_after_ms`（等待最老一笔成本滑出后重试），
-      同时携带标准 `Retry-After` 响应头（秒）。
+    - 超限：不扣减，返回 **429** 与 `retry_after_ms`：按记录到期（score +
+      window_ms）顺序逐组累计届时滑出窗口释放的成本，取累计释放**首次足以
+      容纳本次 cost** 的到期组时刻；同一毫秒到期的记录在同一时刻一起释放，
+      合并为一组判断。因此等待 `retry_after_ms` 后重试必然有足够配额
+      （仅等待最早一笔小成本滑出可能只释放部分配额、重试会再次 429）。
+      `reset_at_ms` 仍表示最老一笔成本的滑出时刻，可能早于该等待点。
+      响应同时携带标准 `Retry-After` 头（秒，向上取整）。
 
     **可选幂等（request_id）**：请求体携带 `request_id` 时，同一
     `client_key` + `request_id` 在其首次请求的窗口内只判定 / 扣减一次，

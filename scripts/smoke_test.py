@@ -25,7 +25,11 @@ cursor 分页不重不漏、非法 cursor/limit 拒绝、批量冲突仅冲突�
 非法 cursor 400、limit 越界 422 / 路由优先于 {task_key} 捕获；
 以及滑动窗口成本限流的
 剩余额度 / 成本累计 / 超限 429 / 窗口滑动恢复 / 并发不超额 /
-参数校验 / 过期数据自动清理，以及 request_id 幂等：
+参数校验 / 过期数据自动清理，以及加权被拒后的重试等待：
+retry_after_ms 按记录到期顺序逐组累计滑出释放的成本、
+取首次足以容纳本次 cost 的到期组（旧"只等最早一笔"会过早重试再次 429）/
+同毫秒到期记录合并为一组判断 / 合并组不足时继续累计后续到期组 /
+reset_at_ms 保持最早记录滑出含义，以及 request_id 幂等：
 重试回放不重复扣减 / 并发相同 request_id 只扣一次 / 429 结果回放 /
 request_id 跨窗口可复用 / 非法 request_id 拒绝；
 以及任务依赖门禁：
@@ -200,6 +204,7 @@ def main():
     result_changes_checks()
     audit_checks()
     limit_checks()
+    limit_retry_grouping_checks()
     dependency_checks()
     checked_commit_checks()
     capacity_checks()
@@ -1256,6 +1261,65 @@ def limit_checks():
     check("weighted allow cost 4 remaining 0",
           code == 200 and b["allowed"] and b["remaining"] == 0, f"{code} {b}")
 
+    # 加权重试等待回归：同窗口先通过 cost 1 再通过 cost 4（limit=5），
+    # 随后 cost 3 被拒。retry_after_ms 必须等到 cost 1 与 cost 4 都滑出
+    # （累计释放 5 >= 3），而不是只等最早的 cost 1 滑出（仅释放 1，重试仍 429）。
+    # 时间线（window=3000ms，两笔计入时刻错开 ~1.1s）：
+    #   判定被拒时刻 s：cost1 约在 s+1.9s 滑出、cost4 约在 s+3.0s 滑出。
+    rkey = f"{key}:retry"
+    code, ra1 = call("POST", path, {"client_key": rkey, "limit": 5,
+                                    "window_ms": 3000, "cost": 1})
+    check("weighted retry allow cost 1",
+          code == 200 and ra1["allowed"] and ra1["remaining"] == 4, f"{code} {ra1}")
+    time.sleep(1.1)  # cost 1 与 cost 4 的计入时刻错开 ~1.1s（到期时刻也错开）
+    code, ra4 = call("POST", path, {"client_key": rkey, "limit": 5,
+                                    "window_ms": 3000, "cost": 4})
+    check("weighted retry allow cost 4",
+          code == 200 and ra4["allowed"] and ra4["remaining"] == 0, f"{code} {ra4}")
+    oldest_reset = ra1["reset_at_ms"]  # cost 1 的滑出时刻（reset_at_ms 最早记录语义）
+    t_deny = int(time.time() * 1000)
+    code, headers, de = call_ex("POST", path, {"client_key": rkey, "limit": 5,
+                                               "window_ms": 3000, "cost": 3})
+    # 关键回归：等待点必须指向 cost 4 的到期（被拒后约 3s），而最早的 cost 1
+    # 约在 1.9s 后才滑出（旧实现给出 ~1.9s，届时只释放 1，重试必然再次 429）
+    check("weighted retry denial -> 429",
+          code == 429 and de["allowed"] is False and de["remaining"] == 0,
+          f"{code} {de}")
+    check("weighted retry_after waits for cumulative release",
+          2500 <= de["retry_after_ms"] <= 3000
+          and de["retry_after_ms"] > (oldest_reset - t_deny) + 500,
+          f"retry_after_ms={de['retry_after_ms']} "
+          f"oldest_wait={oldest_reset - t_deny} (old behavior ~1900)")
+    check("weighted retry reset_at is oldest slide-out",
+          de["reset_at_ms"] == oldest_reset,
+          f"reset={de['reset_at_ms']} oldest={oldest_reset} {de}")
+    check("weighted retry Retry-After header ceil seconds",
+          int(headers.get("Retry-After", "0"))
+          == max(1, (de["retry_after_ms"] + 999) // 1000),
+          f"Retry-After={headers.get('Retry-After')} {de}")
+
+    # 立即重试：一笔都还没滑出（remaining=0）-> 仍 429，reset 仍指向最早记录
+    code, early = call("POST", path, {"client_key": rkey, "limit": 5,
+                                      "window_ms": 3000, "cost": 3})
+    check("weighted retry immediately still denied",
+          code == 429 and early["remaining"] == 0
+          and early["reset_at_ms"] == oldest_reset, f"{code} {early}")
+    # 旧实现给出的等待点之后：cost 1 已滑出（仅释放 1，remaining=1，仍不足 3），
+    # 此时最老记录已是 cost 4 -> 依然 429，且 reset_at 前进为 cost 4 的滑出时刻
+    time.sleep(2.2)
+    code, mid = call("POST", path, {"client_key": rkey, "limit": 5,
+                                    "window_ms": 3000, "cost": 3})
+    check("weighted retry after oldest slide-out still denied",
+          code == 429 and mid["remaining"] == 1
+          and mid["reset_at_ms"] != oldest_reset, f"{code} {mid}")
+    # 再等过 retry_after_ms 指向的 cost 4 滑出点（累计释放 5）-> 放行，剩 2
+    time.sleep(1.0)
+    code, late = call("POST", path, {"client_key": rkey, "limit": 5,
+                                     "window_ms": 3000, "cost": 3})
+    check("weighted retry after hint allowed",
+          code == 200 and late["allowed"] and late["remaining"] == 2,
+          f"{code} {late}")
+
     # 滑动恢复 + 旧数据自动清理：窗口 800ms 打满后等待滑出，应恢复全部额度
     skey = f"{key}:sliding"
     for _ in range(3):
@@ -1456,6 +1520,132 @@ def idempotency_checks():
           x1["allowed"] and y1["allowed"]
           and x1["idempotent_replay"] is False
           and y1["idempotent_replay"] is False, f"{x1} {y1}")
+
+
+def limit_retry_grouping_checks():
+    """加权被拒后 retry_after_ms 回归（直连 Redis 构造确定性的同毫秒记录）：
+    按到期顺序逐组累计释放成本 / 同毫秒到期记录合并为一组判断 /
+    合并组释放不足时继续等待后续到期组。
+
+    该数据布局（同一 score 下多笔不同成本、不同 score 精确错开）无法通过公开
+    API 稳定产生，故与容量汇总回归一样使用极简 RESP 客户端直连构造。
+    连接地址可用 SMOKE_REDIS_HOST / SMOKE_REDIS_PORT 覆盖，
+    限流键前缀用 SMOKE_LIMIT_PREFIX 覆盖，默认 ratelimit。
+    """
+    base = f"smoke-limit-group:{int(time.time() * 1000)}"
+    path = "/v1/limits/check"
+    prefix = os.environ.get("SMOKE_LIMIT_PREFIX", "ratelimit")
+    host = os.environ.get("SMOKE_REDIS_HOST", "localhost")
+    port = int(os.environ.get("SMOKE_REDIS_PORT", "6379"))
+    window = 2000
+
+    try:
+        r = _RespClient(host, port)
+    except OSError as exc:
+        check("limit-group redis reachable", False, f"{host}:{port} {exc}")
+        return
+
+    try:
+        def redis_now_ms():
+            sec, usec = r.execute("TIME")
+            return int(sec) * 1000 + int(usec) // 1000
+
+        def deny(client_key, cost=3):
+            return call_ex("POST", path, {"client_key": client_key, "limit": 5,
+                                          "window_ms": window, "cost": cost})
+
+        def wait_redis_elapsed(ms):
+            """按 Redis 服务器时钟等待 ms 毫秒：起点与循环判定都直接读
+            Redis TIME，busy-poll 至服务器经过足够时长。不能用墙钟 sleep
+            换算（沙箱内各进程虚拟时间速率可能不同），仅在轮询间隙短 sleep
+            让出 CPU。"""
+            target = redis_now_ms() + ms
+            while redis_now_ms() < target:
+                time.sleep(0.002)
+
+        # 场景 A：最早到期组在同一毫秒含 cost 1 + cost 2（合并释放 3），
+        # 700ms 后还有一笔 cost 2。被拒 cost 3 必须等到最早到期组
+        # （合并释放 3 >= 3，约 2000ms 后），而不是等待更晚的单笔 cost 2
+        # （约 2700ms 后，"单笔足以容纳"的错误实现会选它）。
+        # 注意：正常流量下每次检查都会把限流键 PEXPIRE 刷新为 window_ms，
+        # 故键 TTL 始终覆盖最新记录；直连构造数据时须手动给同样的兜底 TTL
+        # （取最新记录到期），否则整键会先于旧记录被 Redis 删除。
+        ka = f"{base}:same-ms"
+        s = redis_now_ms()
+        r.execute("ZADD", f"{prefix}:{ka}", s, "a" * 32 + ":1")
+        r.execute("ZADD", f"{prefix}:{ka}", s, "b" * 32 + ":2")
+        r.execute("ZADD", f"{prefix}:{ka}", s + 700, "c" * 32 + ":2")
+        r.execute("PEXPIRE", f"{prefix}:{ka}", window + 700)
+        g1_expiry, g2_expiry = s + window, s + 700 + window
+        code, headers, da = deny(ka)
+        # 脚本 now 与 s 同为 Redis 服务器时钟，差值仅 1～2ms
+        check("limit-group same-ms merged denial -> 429",
+              code == 429 and da["allowed"] is False and da["remaining"] == 0,
+              f"{code} {da}")
+        check("limit-group same-ms merged release suffices at earliest group",
+              da["reset_at_ms"] == g1_expiry
+              and da["retry_after_ms"] >= (g1_expiry - s) - 50
+              and da["retry_after_ms"] < (g2_expiry - s) - 400,
+              f"retry_after_ms={da['retry_after_ms']} "
+              f"g1={g1_expiry - s} g2={g2_expiry - s}")
+        check("limit-group same-ms reset_at is oldest group",
+              da["reset_at_ms"] == g1_expiry, f"{da} g1={g1_expiry}")
+        check("limit-group same-ms Retry-After header",
+              int(headers.get("Retry-After", "0"))
+              == max(1, (da["retry_after_ms"] + 999) // 1000),
+              f"Retry-After={headers.get('Retry-After')}")
+        # 被拒调用本身也把键 PEXPIRE 刷成 window_ms，需补回覆盖最新记录的
+        # 兜底 TTL，等待期间整键才不会先于较新记录被 Redis 删除
+        r.execute("PEXPIRE", f"{prefix}:{ka}", window + 1500)
+        # 等到最早到期组滑出后 100ms（按服务器经过时长）：同毫秒两笔一起
+        # 滑出、合并释放 3；晚 700ms 的 cost 2 仍在窗口（used=2、remaining=3）
+        wait_redis_elapsed(window + 100)
+        code, later = call("POST", path, {"client_key": ka, "limit": 5,
+                                          "window_ms": window, "cost": 3})
+        check("limit-group same-ms group release admits",
+              code == 200 and later["allowed"] and later["remaining"] == 0,
+              f"{code} {later}")
+
+        # 场景 B：最早到期组合并释放 2（同毫秒 cost 1 + cost 1）仍不足 3，
+        # 必须继续累计到 700ms 后到期的 cost 3（累计释放 5）才足以重试。
+        kb = f"{base}:accumulate"
+        s = redis_now_ms()
+        r.execute("ZADD", f"{prefix}:{kb}", s, "d" * 32 + ":1")
+        r.execute("ZADD", f"{prefix}:{kb}", s, "e" * 32 + ":1")
+        r.execute("ZADD", f"{prefix}:{kb}", s + 700, "f" * 32 + ":3")
+        r.execute("PEXPIRE", f"{prefix}:{kb}", window + 700)
+        g1_expiry, g2_expiry = s + window, s + 700 + window
+        code, _, db = deny(kb)
+        # 脚本 now 比锚点 s 晚 1～5ms，等待值落在第二组（g2-s≈2700）：
+        # 明显大于最早组等待（g1-s≈2000），旧实现只等到最早组必然落在
+        # 2000 附近；上界放宽到 g2 等待 + 少量处理耗时
+        check("limit-group insufficient first group accumulates to next",
+              code == 429 and db["reset_at_ms"] == g1_expiry
+              and (g1_expiry - s) < db["retry_after_ms"] <= (g2_expiry - s) + 50,
+              f"{code} retry_after_ms={db['retry_after_ms']} "
+              f"g1={g1_expiry - s} g2={g2_expiry - s}")
+        # 同上：被拒调用会把键 PEXPIRE 刷成 window_ms，补回覆盖最新记录的 TTL
+        r.execute("PEXPIRE", f"{prefix}:{kb}", window + 1500)
+        # 最早到期组滑出后 100ms：合并释放 2，remaining=2，cost 3 仍放不下
+        # -> 429，reset 前进到第二组（cost 3）到期时刻
+        wait_redis_elapsed(window + 100)
+        code, mid = call("POST", path, {"client_key": kb, "limit": 5,
+                                        "window_ms": window, "cost": 3})
+        # 生产脚本每次检查都把键 PEXPIRE 刷成 window_ms（真实流量下新请求会
+        # 持续延长它）；观察调用同样会刷新，这里补回覆盖最新记录的兜底 TTL
+        r.execute("PEXPIRE", f"{prefix}:{kb}", window + 1500)
+        check("limit-group after first group still denied",
+              code == 429 and mid["remaining"] == 2
+              and mid["reset_at_ms"] == g2_expiry, f"{code} {mid}")
+        # 第二组也滑出后 100ms：累计释放 5，cost 3 放行剩 2
+        wait_redis_elapsed(700)
+        code, late = call("POST", path, {"client_key": kb, "limit": 5,
+                                         "window_ms": window, "cost": 3})
+        check("limit-group after accumulated release allowed",
+              code == 200 and late["allowed"] and late["remaining"] == 2,
+              f"{code} {late}")
+    finally:
+        r.close()
 
 
 def set_dependencies(k, deps):

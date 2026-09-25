@@ -458,14 +458,21 @@ class LimitCheckResponse(BaseModel):
     )
     reset_at_ms: int = Field(
         description=(
-            "窗口内最老一笔成本滑出、可再获得配额的时刻"
-            "（Redis 服务器时钟，Unix 毫秒）"
+            "窗口内最老一笔成本滑出的时刻"
+            "（Redis 服务器时钟，Unix 毫秒）；超限时该时刻可能早于"
+            "retry_after_ms 对应的等待点，最早一笔滑出释放的成本未必"
+            "足以容纳本次 cost"
         )
     )
     retry_after_ms: int = Field(
         default=0,
         ge=0,
-        description="仅超限时返回：建议等待毫秒数（至最老一笔成本滑出窗口）",
+        description=(
+            "仅超限时返回：建议等待毫秒数。按记录到期顺序逐组累计届时滑出"
+            "窗口所释放的成本，取累计释放首次足以容纳本次 cost 的到期组"
+            "时刻（同一毫秒到期的记录合并为一组判断）；等待该时长后重试"
+            "必然有足够配额"
+        ),
     )
 
 
